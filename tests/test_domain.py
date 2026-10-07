@@ -8,8 +8,11 @@ import unittest
 from coldstore.ammonia import Monitor, level_for, validate_ppm
 from coldstore.ammonia import validate_threshold as validate_ammonia_threshold
 from coldstore.audit import Auditor
+from dataclasses import fields
+
 from coldstore.comp import Bank as CompressorBank
 from coldstore.comp import validate_stage
+from coldstore.console.telemetry import Telemetry
 from coldstore.defrost import Controller as DefrostController
 from coldstore.evap import Condenser, validate_baseline as validate_evap_baseline
 from coldstore.fan import PRIMARY, STANDBY, FanSet
@@ -17,7 +20,13 @@ from coldstore.interlock import Interlock
 from coldstore.load import LoadCalculator, compute_load, validate_baseline
 from coldstore.ns import Stage, control_line
 from coldstore.quota import Accumulator, Quota, check_quota, validate_amount
-from coldstore.reporting import audit_export, to_csv
+from coldstore.reporting import (
+    audit_export,
+    list_receipts,
+    materialize_export,
+    resolve_contract,
+    to_csv,
+)
 from coldstore.room import RoomRegistry, validate_zone
 from coldstore.scheduler import Scheduler, validate_threshold
 from coldstore.store import (
@@ -589,6 +598,71 @@ class ReportingCase(unittest.TestCase):
             self.assertEqual(columns, ["time", "kind", "detail", "id"])
             self.assertEqual(rows[0][1], "comp")
             self.assertEqual(rows[0][2], "2.0000")
+
+    def test_legacy_columns_remain_available(self) -> None:
+        audit_v1 = resolve_contract("audit", "v1")
+        audit_v2 = resolve_contract("audit", "v2")
+        telemetry_v1 = resolve_contract("telemetry", "v1")
+        telemetry_v2 = resolve_contract("telemetry", "v2")
+        self.assertEqual(audit_v1.columns, ("time", "kind", "detail", "id"))
+        self.assertEqual(audit_v2.columns, ("id", "time", "kind", "detail"))
+        self.assertEqual(audit_v1.status, "legacy")
+        self.assertEqual(telemetry_v1.columns, ("metric", "value"))
+        self.assertEqual(tuple(telemetry_v2.columns), tuple(field.name for field in fields(Telemetry)))
+        self.assertIn("store_keys", telemetry_v2.columns)
+
+    def test_missing_values_are_blank_and_receipted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(f"{tmp}/state.json")
+            output = f"{tmp}/exports/audit.csv"
+            target, metadata = materialize_export(
+                "audit",
+                [{"id": "1", "time": "now", "kind": "cycle"}],
+                tmp,
+                store=store,
+                version="v2",
+                file_path=output,
+            )
+            self.assertEqual(target, output)
+            with open(target, encoding="utf-8") as handle:
+                text = handle.read()
+            self.assertTrue(text.startswith("id,time,kind,detail\n1,now,cycle,\n"))
+            self.assertEqual(metadata["summary"]["missing_count"], 1)
+            self.assertEqual(metadata["summary"]["differences"][0]["reason"], "missing")
+            receipt = list_receipts(store, "audit")[0]
+            self.assertEqual(receipt.generation, "complete_atomic")
+            self.assertEqual(receipt.missing_policy, "blank")
+            self.assertEqual(receipt.rows, 1)
+            self.assertEqual(receipt.contract["name"], "audit")
+            self.assertEqual(receipt.contract["columns"], ["id", "time", "kind", "detail"])
+            self.assertTrue(receipt.checksum)
+
+    def test_batches_are_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(f"{tmp}/state.json")
+            records = [
+                {"id": str(index), "time": str(index), "kind": "cycle", "detail": ""}
+                for index in range(5)
+            ]
+            _, metadata = materialize_export(
+                "audit",
+                records,
+                tmp,
+                store=store,
+                version="v2",
+                batch_size=2,
+            )
+            self.assertEqual(metadata["receipt"]["rows"], 5)
+            self.assertEqual(metadata["receipt"]["batches"], 3)
+            with self.assertRaises(ValueError):
+                materialize_export(
+                    "audit",
+                    records,
+                    tmp,
+                    store=store,
+                    version="v2",
+                    batch_size=1001,
+                )
 
 
 if __name__ == "__main__":

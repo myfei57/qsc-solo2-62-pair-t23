@@ -50,7 +50,17 @@ class Server:
         """Call a route directly, used by the test suite and CLI probes."""
 
         request = Request(method=method.upper(), path=path, query={}, payload=dict(payload or {}))
-        return self.respond(request)
+        response = self.respond(request)
+        if response.path is not None:
+            with open(response.path, "rb") as handle:
+                body = handle.read()
+            return Response(
+                status=response.status,
+                body=body,
+                content_type=response.content_type,
+                extra_headers=response.extra_headers,
+            )
+        return response
 
     def __call__(
         self, environ: dict[str, object], start_response: Callable[..., object]
@@ -61,7 +71,21 @@ class Server:
             response = error_response(exc.status, exc.message)
         status, headers = response.wsgi()
         start_response(status, headers)
+        if response.path is not None:
+            return _file_response(response.path)
         return [response.body]
+
+
+def _file_response(path: str) -> Iterable[bytes]:
+    def generate() -> Iterable[bytes]:
+        with open(path, "rb") as handle:
+            while True:
+                chunk = handle.read(64 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+
+    return generate()
 
 
 def create_application(store: Store) -> Server:

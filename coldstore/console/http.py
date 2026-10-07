@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 from urllib.parse import parse_qs
@@ -35,12 +36,16 @@ class Response:
     status: int
     body: bytes
     content_type: str
+    path: str | None = None
+    extra_headers: tuple[tuple[str, str], ...] = ()
 
     def wsgi(self) -> tuple[str, list[tuple[str, str]]]:
         reason = STATUS_TEXT.get(self.status, "Unknown")
+        length = len(self.body) if self.path is None else os.path.getsize(self.path)
         headers = [
             ("Content-Type", self.content_type),
-            ("Content-Length", str(len(self.body))),
+            ("Content-Length", str(length)),
+            *self.extra_headers,
         ]
         return f"{self.status} {reason}", headers
 
@@ -54,8 +59,19 @@ def text_response(text: str, status: int = 200) -> Response:
     return Response(status=status, body=text.encode("utf-8"), content_type="text/plain; charset=utf-8")
 
 
-def csv_response(text: str, status: int = 200) -> Response:
-    return Response(status=status, body=text.encode("utf-8"), content_type="text/csv; charset=utf-8")
+def csv_response(
+    text: str,
+    status: int = 200,
+    path: str | None = None,
+    extra_headers: tuple[tuple[str, str], ...] = (),
+) -> Response:
+    return Response(
+        status=status,
+        body=text.encode("utf-8"),
+        content_type="text/csv; charset=utf-8",
+        path=path,
+        extra_headers=extra_headers,
+    )
 
 
 def error_response(status: int, message: str) -> Response:

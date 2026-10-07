@@ -123,8 +123,10 @@ def route_table() -> list[Route]:
         Route("GET", "/schedule", "defrost schedule for the rooms", "schedule_state"),
         Route("POST", "/schedule/threshold", "set the defrost temperature threshold", "schedule_threshold"),
         Route("POST", "/schedule/plan", "plan defrost order by temperature", "schedule_plan"),
-        Route("GET", "/export/audit", "runtime audit trail as CSV", "export_audit"),
-        Route("GET", "/export/telemetry", "telemetry counters as CSV", "export_telemetry"),
+        Route("GET", "/export/contracts", "versioned CSV field contracts", "export_contracts"),
+        Route("GET", "/export/audit", "runtime audit trail as a contract CSV", "materialize_audit_export"),
+        Route("GET", "/export/telemetry", "telemetry counters as a contract CSV", "materialize_telemetry_export"),
+        Route("GET", "/export/ledger", "export generation traceability ledger", "export_ledger"),
         Route("POST", "/cycle", "run a full control cycle", "cycle"),
         Route("POST", "/simulate", "run deterministic simulation ticks", "simulate"),
     ]

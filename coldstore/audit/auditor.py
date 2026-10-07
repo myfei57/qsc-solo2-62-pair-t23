@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 from coldstore.store.commands import append_command, load_commands
@@ -45,7 +46,9 @@ class Auditor:
         return entry
 
     def entries(self) -> list[Entry]:
-        entries: list[Entry] = []
+        return list(self.iter_entries())
+
+    def iter_entries(self) -> Iterator[Entry]:
         for item in load_commands(self._store, AUDIT_KEY):
             try:
                 payload = json.loads(item)
@@ -53,15 +56,12 @@ class Auditor:
                 continue
             if not isinstance(payload, dict):
                 continue
-            entries.append(
-                Entry(
-                    id=str(payload.get("id", "")),
-                    time=str(payload.get("time", "")),
-                    kind=str(payload.get("kind", "")),
-                    detail=str(payload.get("detail", "")),
-                )
+            yield Entry(
+                id=str(payload.get("id", "")),
+                time=str(payload.get("time", "")),
+                kind=str(payload.get("kind", "")),
+                detail=str(payload.get("detail", "")),
             )
-        return entries
 
     def last(self) -> Entry | None:
         entries = self.entries()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 from coldstore.ammonia import validate_ppm, validate_threshold
@@ -11,7 +12,15 @@ from coldstore.fan import PRIMARY, STANDBY
 from coldstore.load import validate_baseline as validate_load_baseline
 from coldstore.ns import Stage, control_line
 from coldstore.quota import Quota, check_quota, validate_amount
-from coldstore.reporting import audit_export, telemetry_export, to_csv
+from coldstore.reporting import (
+    MAX_EXPORT_BATCH_SIZE,
+    contract_catalog,
+    iter_audit_records,
+    list_receipts,
+    materialize_export,
+    telemetry_legacy_records,
+    telemetry_records,
+)
 from coldstore.room import validate_zone
 from coldstore.scheduler import validate_threshold as validate_schedule_threshold
 from coldstore.store import export_state
@@ -665,14 +674,85 @@ def schedule_plan(server: "Server", request: Request) -> Response:
     )
 
 
-def export_audit(server: "Server", request: Request) -> Response:
-    columns, rows = audit_export(server.runtime.auditor)
-    return csv_response(to_csv(columns, rows))
+def _export_version(request: Request) -> str | None:
+    if request.query.get("version"):
+        return request.query["version"][0]
+    value = request.payload.get("version")
+    if value is None:
+        return None
+    return str(value)
 
 
-def export_telemetry(server: "Server", request: Request) -> Response:
-    columns, rows = telemetry_export(telemetry_module.collect(server.runtime))
-    return csv_response(to_csv(columns, rows))
+def _export_dir(store_path: str) -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(store_path)) or ".", "exports")
+
+
+def _export_headers(receipt: dict[str, object]) -> tuple[tuple[str, str], ...]:
+    headers = (
+        ("X-Export-Contract", f"{receipt['export_name']}:{receipt['contract_version']}"),
+        ("X-Export-Fingerprint", str(receipt["contract_fingerprint"])),
+        ("X-Export-Checksum", str(receipt["checksum"])),
+        ("X-Export-Receipt", str(receipt["id"])),
+    )
+    if receipt["contract_version"] == "v1":
+        headers += ("X-Export-Compatibility", "legacy; retained during compatibility window"),
+    return headers
+
+
+def export_contracts(server: "Server", request: Request) -> Response:
+    return json_response(
+        {
+            "missing_policy": "blank",
+            "generation": "complete_atomic",
+            "max_batch_size": MAX_EXPORT_BATCH_SIZE,
+            "contracts": [contract.as_dict() for contract in contract_catalog()],
+        }
+    )
+
+
+def materialize_audit_export(server: "Server", request: Request) -> Response:
+    auditor = server.runtime.auditor
+    records = iter_audit_records(auditor)
+    selected_version = _export_version(request)
+    target, metadata = materialize_export(
+        "audit",
+        records,
+        _export_dir(server.runtime.store.path),
+        store=server.runtime.store,
+        version=selected_version,
+        batch_size=request.int_field("batch_size", MAX_EXPORT_BATCH_SIZE),
+    )
+    with open(target, "r", encoding="utf-8") as handle:
+        text = handle.read()
+    receipt = metadata["receipt"]
+    return csv_response(text, path=target, extra_headers=_export_headers(receipt))
+
+
+def materialize_telemetry_export(server: "Server", request: Request) -> Response:
+    telemetry = telemetry_module.collect(server.runtime)
+    version = _export_version(request)
+    records = telemetry_legacy_records(telemetry) if version in (None, "v1") else telemetry_records(telemetry)
+    target, metadata = materialize_export(
+        "telemetry",
+        records,
+        _export_dir(server.runtime.store.path),
+        store=server.runtime.store,
+        version=version,
+        batch_size=request.int_field("batch_size", MAX_EXPORT_BATCH_SIZE),
+        api_records=records if version != "v1" else None,
+    )
+    with open(target, "r", encoding="utf-8") as handle:
+        text = handle.read()
+    receipt = metadata["receipt"]
+    return csv_response(text, path=target, extra_headers=_export_headers(receipt))
+
+
+def export_ledger(server: "Server", request: Request) -> Response:
+    export_name = request.query.get("name", [None])[0]
+    if export_name is None and request.payload.get("name") is not None:
+        export_name = request.str_field("name")
+    receipts = [receipt.as_dict() for receipt in list_receipts(server.runtime.store, export_name)]
+    return json_response({"receipts": receipts, "count": len(receipts)})
 
 
 def cycle(server: "Server", request: Request) -> Response:

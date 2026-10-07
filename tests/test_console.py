@@ -406,9 +406,31 @@ class ConsoleCase(unittest.TestCase):
         status, body = self.call("GET", "/export/audit")
         self.assertEqual(status, 200)
         self.assertIn("time,kind,detail,id", body)
+        status, body = self.call("GET", "/export/audit", {"version": "v2"})
+        self.assertIn("id,time,kind,detail", body)
         status, body = self.call("GET", "/export/telemetry")
         self.assertIn("metric,value", body)
         self.assertIn("store_keys", body)
+        status, body = self.call("GET", "/export/telemetry", {"version": "v2"})
+        self.assertTrue(body.startswith(
+            "store_keys,rooms,defrosting,average_temp,compressors,compressors_running,"
+            "total_stage,max_stage,load_ratio,supply_open,temp_value,temp_rate,temp_within,"
+            "ammonia_last,ammonia_latched,interlock_tripped,interlock_trips,cold_primary,"
+            "cold_running,evap_temperature,evap_above,defrost_warmups,cooling_load,"
+            "quota_value,audit_entries,schedule_due\n"
+        ))
+
+        status, body = self.call("GET", "/export/contracts")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["missing_policy"], "blank")
+        self.assertEqual(body["generation"], "complete_atomic")
+        self.assertEqual(body["max_batch_size"], 1000)
+        self.assertEqual(len(body["contracts"]), 4)
+
+        status, body = self.call("GET", "/export/ledger")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["count"], 4)
+        self.assertEqual({receipt["export_name"] for receipt in body["receipts"]}, {"audit", "telemetry"})
 
     def test_metrics_and_errors(self) -> None:
         self.call("GET", "/health")
