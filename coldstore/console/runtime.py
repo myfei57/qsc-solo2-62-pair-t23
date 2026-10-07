@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from coldstore.ammonia import Monitor
 from coldstore.audit import Auditor
 from coldstore.comp import Bank
@@ -11,11 +13,14 @@ from coldstore.fan import FanSet
 from coldstore.interlock import Interlock
 from coldstore.load import LoadCalculator
 from coldstore.quota import Accumulator
+from coldstore.reporting import BUILTIN_CONTRACTS, ContractRegistry, ExportRunner
 from coldstore.room import RoomRegistry
 from coldstore.scheduler import Scheduler
 from coldstore.store import Store
 from coldstore.temp import Collector
 from coldstore.valve import SupplyValve
+
+EXPORT_LEDGER_KEY = "export:ledger"
 
 
 class Runtime:
@@ -40,3 +45,10 @@ class Runtime:
         self.accumulator = Accumulator(store)
         self.auditor = Auditor(store)
         self.scheduler = Scheduler(store)
+        self.export_ledger = Auditor(store, key=EXPORT_LEDGER_KEY)
+        self.contracts = ContractRegistry(store, self.export_ledger)
+        export_dir = os.path.join(os.path.dirname(store.path), "exports")
+        self.exports = ExportRunner(store, self.export_ledger, export_dir)
+        for contract in BUILTIN_CONTRACTS:
+            if self.contracts.get(contract.id, contract.version) is None:
+                self.contracts.register(contract, reason="built-in default")

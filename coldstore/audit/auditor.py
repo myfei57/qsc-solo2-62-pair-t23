@@ -29,10 +29,16 @@ class Entry:
 
 
 class Auditor:
-    """Records and queries runtime entries."""
+    """Records and queries runtime entries.
 
-    def __init__(self, store: Store) -> None:
+    ``key`` selects the underlying append only list, so separate trails
+    (for example the export ledger) can share this implementation without
+    mixing entries with the control decision trail.
+    """
+
+    def __init__(self, store: Store, key: str = AUDIT_KEY) -> None:
         self._store = store
+        self._key = key
 
     def record(self, kind: str, detail: str) -> Entry:
         entry = Entry(
@@ -41,12 +47,12 @@ class Auditor:
             kind=kind,
             detail=detail,
         )
-        append_command(self._store, AUDIT_KEY, json.dumps(entry.as_dict(), ensure_ascii=False))
+        append_command(self._store, self._key, json.dumps(entry.as_dict(), ensure_ascii=False))
         return entry
 
     def entries(self) -> list[Entry]:
         entries: list[Entry] = []
-        for item in load_commands(self._store, AUDIT_KEY):
+        for item in load_commands(self._store, self._key):
             try:
                 payload = json.loads(item)
             except ValueError:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import time
 from typing import TYPE_CHECKING
 
 from coldstore.ammonia import validate_ppm, validate_threshold
@@ -11,7 +13,15 @@ from coldstore.fan import PRIMARY, STANDBY
 from coldstore.load import validate_baseline as validate_load_baseline
 from coldstore.ns import Stage, control_line
 from coldstore.quota import Quota, check_quota, validate_amount
-from coldstore.reporting import audit_export, telemetry_export, to_csv
+from coldstore.reporting import (
+    AUDIT_CONTRACT,
+    COMPLETED,
+    TELEMETRY_CONTRACT,
+    Contract,
+    Field,
+    render_batch,
+    render_header,
+)
 from coldstore.room import validate_zone
 from coldstore.scheduler import validate_threshold as validate_schedule_threshold
 from coldstore.store import export_state
@@ -24,7 +34,14 @@ from . import simulate as simulate_module
 from . import snapshot as snapshot_module
 from . import telemetry as telemetry_module
 from .cycle import run_cycle
-from .http import Request, Response, csv_response, json_response, text_response
+from .http import (
+    Request,
+    RequestError,
+    Response,
+    csv_response,
+    json_response,
+    text_response,
+)
 from .report import text_report
 from .routes import route_table
 from .system import system_payload
@@ -32,6 +49,10 @@ from .version import version_payload
 
 if TYPE_CHECKING:  # pragma: no cover - imported only for type checkers
     from .server import Server
+
+
+def _today() -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime())
 
 
 def _fan_set(server: "Server", request: Request):
@@ -666,13 +687,137 @@ def schedule_plan(server: "Server", request: Request) -> Response:
 
 
 def export_audit(server: "Server", request: Request) -> Response:
-    columns, rows = audit_export(server.runtime.auditor)
-    return csv_response(to_csv(columns, rows))
+    contract = server.runtime.contracts.latest_serveable("audit", _today()) or AUDIT_CONTRACT
+    records = [entry.as_dict() for entry in server.runtime.auditor.entries()]
+    return csv_response(render_header(contract) + render_batch(contract, records))
 
 
 def export_telemetry(server: "Server", request: Request) -> Response:
-    columns, rows = telemetry_export(telemetry_module.collect(server.runtime))
-    return csv_response(to_csv(columns, rows))
+    contract = (
+        server.runtime.contracts.latest_serveable("telemetry", _today()) or TELEMETRY_CONTRACT
+    )
+    collected = telemetry_module.collect(server.runtime)
+    records = [{"metric": key, "value": value} for key, value in collected.as_dict().items()]
+    return csv_response(render_header(contract) + render_batch(contract, records))
+
+
+def export_contracts(server: "Server", request: Request) -> Response:
+    """The export page: every registered contract version and its status."""
+
+    contracts = server.runtime.contracts
+    return json_response(
+        {
+            "contracts": [
+                {
+                    **contract.as_dict(),
+                    "serveable": contracts.serveable(contract, _today()),
+                }
+                for contract in contracts.list()
+            ]
+        }
+    )
+
+
+def export_contract_register(server: "Server", request: Request) -> Response:
+    """Register a new immutable contract version; the diff is returned and ledgered."""
+
+    raw_fields = request.payload.get("fields")
+    if not isinstance(raw_fields, list) or not raw_fields:
+        raise RequestError(400, "fields must be a non-empty list of objects")
+    if any(not isinstance(item, dict) for item in raw_fields):
+        raise RequestError(400, "fields must be a non-empty list of objects")
+    contract = Contract(
+        id=request.str_field("id"),
+        version=request.int_field("version"),
+        sunset=request.str_field("sunset"),
+        note=request.str_field("note"),
+        fields=tuple(Field.from_dict(item) for item in raw_fields),
+    )
+    try:
+        registered, changes = server.runtime.contracts.register(
+            contract, reason=request.str_field("reason")
+        )
+    except ValueError as exc:
+        raise RequestError(400, str(exc)) from exc
+    return json_response(
+        {
+            "contract": registered.as_dict(),
+            "changes": [change.as_dict() for change in changes],
+        }
+    )
+
+
+def export_contract_deprecate(server: "Server", request: Request) -> Response:
+    """Start the compatibility window for a version by giving it a sunset day."""
+
+    try:
+        contract = server.runtime.contracts.deprecate(
+            request.str_field("id"),
+            request.int_field("version"),
+            request.str_field("sunset"),
+            reason=request.str_field("reason"),
+        )
+    except ValueError as exc:
+        raise RequestError(400, str(exc)) from exc
+    return json_response({"contract": contract.as_dict()})
+
+
+def export_audit_archive(server: "Server", request: Request) -> Response:
+    """Run a persisted audit export at a pinned or the latest serveable version."""
+
+    version = request.int_field("version", 0) or None
+    contracts = server.runtime.contracts
+    contract = contracts.get("audit", version) if version else contracts.latest("audit")
+    if contract is None:
+        raise RequestError(404, "no audit contract registered")
+    if not contracts.serveable(contract, _today()):
+        raise RequestError(400, f"contract audit v{contract.version} is past its sunset")
+    records = [entry.as_dict() for entry in server.runtime.auditor.entries()]
+    manifest = server.runtime.exports.run(contract, records)
+    status = 200 if manifest.status == COMPLETED else 400
+    return json_response({"run": manifest.as_dict()}, status=status)
+
+
+def export_runs(server: "Server", request: Request) -> Response:
+    """The runs page, read from the same manifests that own the stored files."""
+
+    runs = []
+    for manifest in server.runtime.exports.list():
+        artifact = (
+            "available"
+            if manifest.status == COMPLETED
+            and os.path.exists(server.runtime.exports.file_path(manifest))
+            else "missing"
+        )
+        runs.append({**manifest.as_dict(), "artifact": artifact})
+    return json_response({"runs": runs})
+
+
+def export_run(server: "Server", request: Request) -> Response:
+    manifest = server.runtime.exports.get(request.str_field("id"))
+    if manifest is None:
+        raise RequestError(404, "no export run with that id")
+    return json_response({"run": manifest.as_dict()})
+
+
+def export_file(server: "Server", request: Request) -> Response:
+    """Serve the stored artifact bytes for a run; never regenerated on demand."""
+
+    manifest = server.runtime.exports.get(request.str_field("id"))
+    if manifest is None or manifest.status != COMPLETED:
+        raise RequestError(404, "no completed export run with that id")
+    try:
+        with open(server.runtime.exports.file_path(manifest), "r", encoding="utf-8") as handle:
+            return csv_response(handle.read())
+    except FileNotFoundError:
+        raise RequestError(404, "export artifact is missing from storage")
+
+
+def export_ledger(server: "Server", request: Request) -> Response:
+    """The traceability ledger: contract changes and export run outcomes."""
+
+    entries = [entry.as_dict() for entry in server.runtime.export_ledger.entries()]
+    return json_response({"entries": entries, "count": len(entries)})
 
 
 def cycle(server: "Server", request: Request) -> Response:
